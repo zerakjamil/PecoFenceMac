@@ -18,6 +18,7 @@ jobs:
       - run: cargo clippy --locked -p pecofence-mac-cli -- -D warnings
       - run: bash scripts/build-macos.sh
       - run: python3 scripts/test-macos.py
+      - run: bash scripts/test-macos-native.sh
       - uses: actions/upload-artifact@v4
         with:
           name: PecoFence-macOS

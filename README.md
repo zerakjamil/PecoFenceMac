@@ -11,6 +11,11 @@ configuration format, snapshots, and backups.
 - Route Desktop files by extension, save layouts, and import/export configuration.
 - Use **⌘⌥Space** for Peek, **Esc** to return, and the bundled JSON CLI for scripts.
 - Choose System, Light, or Dark appearance across panels and settings.
+- Open project folders in Terminal, VS Code, Xcode, or a chosen app from context menus.
+- Preview with Space, navigate with arrows, and copy files with Command-C.
+- Show local Git branch/change counts in portal footers; optionally hide build folders.
+- Save project workspaces, switch with **⌘⌥[ / ⌘⌥]**, and restore matching layouts when displays reconnect.
+- Enable **Snap reordering** to insert a dragged fence into another stack; disable it for free movement.
 
 Requires macOS 14+, Xcode command-line tools, and Rust stable. Tested on Apple
 Silicon with macOS 26.5.1.
@@ -22,6 +27,19 @@ open "$HOME/Library/Caches/PecoFence/build/PecoFence.app"
 
 [Mac installation, CLI, and limitations](macos/README.md) ·
 [Proposed developer features](macos/ROADMAP.md)
+
+#Optional Desktop cleanup hides fenced originals in Finder while retaining their
+locations. First-click controls and short coordinated folding animations keep
+common actions quick. See [Mac usage](macos/README.md) for settings and shortcuts.
+
+## Credit
+
+**Original creator: [DayuanJiang](https://github.com/DayuanJiang).**
+PecoFenceMac is derived from [PecoFence](https://github.com/DayuanJiang/PecoFence),
+created by DayuanJiang and its contributors. The original Rust core provides the
+data model, rule engine, snapshots, and configuration backups. This repository
+adds the macOS shell and developer tools. Original Apache 2.0 license and notices
+are retained; credit for the original project remains with its authors.
 
 Apache 2.0. Original Windows source and notices are retained. The Mac port does
 not yet implement every upstream feature; see the linked limitations.

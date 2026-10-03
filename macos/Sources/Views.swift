@@ -28,12 +28,12 @@ struct PanelTitle: NSViewRepresentable {
     }
 }
 final class TitleDragView: NSView {
+    override func acceptsFirstMouse(for event:NSEvent?) -> Bool { true }
     let label = NSTextField(labelWithString: "")
     var locked = false
     var collapse: (() -> Void)?
     var rename: (() -> Void)?
     var leading: NSLayoutConstraint!
-    private var pendingClick: DispatchWorkItem?
     override init(frame: NSRect) {
         super.init(frame:frame)
         label.font = .systemFont(ofSize:13, weight:.semibold)
@@ -47,11 +47,10 @@ final class TitleDragView: NSView {
         setAccessibilityCustomActions([NSAccessibilityCustomAction(name:"Rename",target:self,selector:#selector(renameAccessibly))])
     }
     required init?(coder:NSCoder) { fatalError("init(coder:) unsupported") }
-    override func hitTest(_ point:NSPoint) -> NSView? { bounds.contains(point) ? self : nil }
-    override func accessibilityPerformPress() -> Bool { pendingClick?.cancel(); collapse?(); return true }
-    @objc func renameAccessibly() -> Bool { pendingClick?.cancel(); rename?(); return true }
+    override func hitTest(_ point:NSPoint) -> NSView? { bounds.contains(convert(point,from:superview)) ? self : nil }
+    override func accessibilityPerformPress() -> Bool { collapse?(); return true }
+    @objc func renameAccessibly() -> Bool { rename?(); return true }
     override func mouseDown(with event:NSEvent) {
-        pendingClick?.cancel()
         if event.clickCount == 2 {
             let point = convert(event.locationInWindow,from:nil)
             let nameWidth = min(label.intrinsicContentSize.width,label.frame.width)
@@ -61,16 +60,20 @@ final class TitleDragView: NSView {
         }
         guard let window else { return }
         let start = event.locationInWindow
+        var reordering = false
+        var dragged = false
         while let next = window.nextEvent(matching:[.leftMouseDragged,.leftMouseUp]) {
             if next.type == .leftMouseUp {
-                let click = DispatchWorkItem { [weak self] in self?.collapse?() }
-                pendingClick = click
-                DispatchQueue.main.asyncAfter(deadline:.now()+NSEvent.doubleClickInterval,execute:click)
+                if reordering { AppDelegate.shared.finishReorder(window:window) }
+                else if !dragged { collapse?() }
                 return
             }
-            if !locked && hypot(next.locationInWindow.x-start.x,next.locationInWindow.y-start.y) >= 3 {
-                window.performDrag(with:event)
-                return
+            if hypot(next.locationInWindow.x-start.x,next.locationInWindow.y-start.y) >= 3 {
+                dragged = true
+                if locked { continue }
+                if AppDelegate.shared.store.preferences.snapReordering {
+                    reordering = true; AppDelegate.shared.previewReorder(window:window)
+                } else { window.performDrag(with:event); return }
             }
         }
     }
@@ -81,6 +84,7 @@ struct ResizeGrip: NSViewRepresentable {
     func updateNSView(_ view:ResizeView, context:Context) { view.locked = locked }
 }
 final class ResizeView: NSView {
+    override func acceptsFirstMouse(for event:NSEvent?) -> Bool { true }
     var locked = false
     override func mouseDown(with event:NSEvent) {
         guard !locked, let window else { return }
@@ -108,6 +112,7 @@ struct FenceView: View {
     let fenceID: String
     @State private var directory: URL?
     @State private var selected: String?
+    @FocusState private var focusedFile: String?
     var fence: Fence? { store.state.fences.first { $0.id == fenceID } }
 
     var body: some View {
@@ -128,6 +133,8 @@ struct FenceView: View {
                         Button("Add files…") { AppDelegate.shared.addFiles(fence) }.disabled(fence.kind == "folderPortal")
                         if fence.kind == "folderPortal", let path = fence.source.path {
                             Button("Open folder in Finder") { NSWorkspace.shared.open(URL(fileURLWithPath:path)) }
+                            projectMenu(URL(fileURLWithPath:path))
+                            Toggle("Hide build and dependency folders",isOn:Binding(get:{store.preferences.filteredPortals.contains(fence.id)},set:{_ in store.toggleFilters(fence)}))
                         }
                         Menu("View") {
                             Button("Icons") { store.update(fence,["view":"icons"]) }
@@ -144,14 +151,14 @@ struct FenceView: View {
                             Divider()
                             Button("Delete fence…") { AppDelegate.shared.delete(fence) }
                         }
-                    } label: { Image(systemName:"ellipsis") }
+                    } label: { Image(systemName:"ellipsis").frame(width:24,height:28).contentShape(Rectangle()) }
                     .menuStyle(.borderlessButton).fixedSize().accessibilityLabel("Fence options")
                     Button { store.toggleCollapsed(fence) } label: {
-                        Image(systemName:fence.rolledUp ? "chevron.down" : "chevron.up")
+                        Image(systemName:fence.rolledUp ? "chevron.down" : "chevron.up").frame(width:24,height:28).contentShape(Rectangle())
                     }.buttonStyle(.plain).accessibilityLabel(fence.rolledUp ? "Expand fence" : "Collapse fence")
                     }.padding(.horizontal,12)
                 }.frame(height:38)
-                if !fence.rolledUp {
+                if !fence.rolledUp || store.closingFences.contains(fenceID) {
                     Divider()
                     if fence.kind == "folderPortal", let path = fence.source.path {
                         HStack {
@@ -167,13 +174,21 @@ struct FenceView: View {
                     HStack {
                         Text("\(store.entries(fence,directory:directory).count) files").font(.caption2).foregroundStyle(.secondary)
                         Spacer()
+                        if let path = directory?.path ?? fence.source.path, let git = store.gitSummaries[path] {
+                            Label(git.label,systemImage:"arrow.triangle.branch").font(.caption2).lineLimit(1).help(git.label)
+                        }
                         ResizeGrip(locked:fence.locked).frame(width:18,height:18).accessibilityLabel("Resize fence")
                     }.padding(.leading,12).padding(.trailing,2).frame(height:24)
                 }
             }
+            .transaction { $0.animation = nil }
             .background(DesktopMaterial())
             .clipShape(RoundedRectangle(cornerRadius:12))
-            .overlay(RoundedRectangle(cornerRadius:12).strokeBorder(store.dropTarget == fenceID ? Color.accentColor : Color.primary.opacity(0.15),lineWidth:store.dropTarget == fenceID ? 2 : 1))
+            .overlay(RoundedRectangle(cornerRadius:12).strokeBorder(store.dropTarget == fenceID || store.reorderTarget == fenceID ? Color.accentColor : Color.primary.opacity(0.15),lineWidth:store.dropTarget == fenceID || store.reorderTarget == fenceID ? 2 : 1))
+            .task(id:directory?.path ?? fence.source.path) {
+                if fence.kind == "folderPortal", let path = directory?.path ?? fence.source.path { store.requestGit(URL(fileURLWithPath:path),fenceID:fenceID) }
+            }
+            .onChange(of:directory) { selected = nil; focusedFile = nil }
             .onExitCommand { AppDelegate.shared.endPeek() }
         }
     }
@@ -212,12 +227,12 @@ struct FenceView: View {
         return Group {
             if list {
                 HStack(spacing:8) {
-                    Image(nsImage:NSWorkspace.shared.icon(forFile:file.path)).resizable().frame(width:24,height:24)
+                    Image(nsImage:FileIcons.icon(file)).resizable().frame(width:24,height:24)
                     Text(file.name).lineLimit(1).font(.system(size:12)); Spacer()
                 }.padding(5)
             } else {
                 VStack(spacing:5) {
-                    Image(nsImage:NSWorkspace.shared.icon(forFile:file.path)).resizable().frame(width:44,height:44)
+                    Image(nsImage:FileIcons.icon(file)).resizable().frame(width:44,height:44)
                     Text(file.name).font(.system(size:11)).lineLimit(2).multilineTextAlignment(.center).frame(height:30,alignment:.top)
                 }.padding(5).frame(maxWidth:.infinity)
             }
@@ -226,15 +241,32 @@ struct FenceView: View {
         .clipShape(RoundedRectangle(cornerRadius:5))
         .contentShape(Rectangle())
         .onTapGesture(count:2) { open(file,fence:fence) }
-        .onTapGesture { selected = file.id }
+        .simultaneousGesture(TapGesture().onEnded { selected = file.id; focusedFile = file.id })
         .focusable()
+        .focused($focusedFile,equals:file.id)
         .onKeyPress(.return) { open(file,fence:fence); return .handled }
+        .onKeyPress(.space) { preview(file,fence:fence); return .handled }
+        .onKeyPress(keys:[.leftArrow,.rightArrow,.upArrow,.downArrow]) { key in
+            let files = store.entries(fence,directory:directory)
+            guard let index = files.firstIndex(where: { $0.id == file.id }) else { return .ignored }
+            let columns = fence.view == "list" ? 1 : max(1,Int((fence.geometry.w-20)/86))
+            let step = key.key == .leftArrow ? -1 : key.key == .rightArrow ? 1 : key.key == .upArrow ? -columns : columns
+            let next = files[min(max(0,index+step),files.count-1)].id
+            selected = next; focusedFile = next; return .handled
+        }
+        .onKeyPress(keys:["c"]) { key in
+            guard key.modifiers.contains(.command) else { return .ignored }
+            NSPasteboard.general.clearContents(); NSPasteboard.general.writeObjects([url as NSURL]); return .handled
+        }
         .accessibilityElement(children:.ignore)
         .accessibilityLabel(file.name).accessibilityAddTraits(.isButton)
         .onDrag { NSItemProvider(object:url as NSURL) }
         .contextMenu {
             Button("Open") { open(file,fence:fence) }
+            Button("Quick Look") { preview(file,fence:fence) }
+            projectMenu(ProjectActions.folder(for:file))
             Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+            Button("Copy path") { ProjectActions.copyPath(url) }
             Button("Copy file") {
                 NSPasteboard.general.clearContents(); NSPasteboard.general.writeObjects([url as NSURL])
             }
@@ -246,6 +278,21 @@ struct FenceView: View {
                 }
             }
         }
+    }
+    func projectMenu(_ folder:URL) -> some View {
+        Menu("Open project in") {
+            ForEach(ProjectActions.applications) { application in
+                Button(application.name) { ProjectActions.open(folder:folder,application:application,store:store) }
+                    .disabled(ProjectActions.target(folder:folder,application:application) == nil)
+            }
+            Divider()
+            Button("Choose application…") { AppDelegate.shared.openProjectWith(folder) }
+            Button("Copy folder path") { ProjectActions.copyPath(folder) }
+        }
+    }
+    func preview(_ file:FileEntry,fence:Fence) {
+        selected = file.id
+        AppDelegate.shared.preview.show(files:store.entries(fence,directory:directory),selected:file.id,window:AppDelegate.shared.fences[fenceID]?.panel)
     }
     func open(_ file:FileEntry,fence:Fence) {
         if file.isFolder && fence.kind == "folderPortal" { directory = URL(fileURLWithPath:file.path) }
@@ -272,7 +319,7 @@ struct SettingsView: View {
             TabView {
                 general.tabItem { Text("General") }
                 rules.tabItem { Text("Rules") }
-                snapshots.tabItem { Text("Layouts") }
+                snapshots.tabItem { Text("Workspaces") }
             }.padding(16)
             HStack {
                 Text(store.busy ? "Saving…" : "Native macOS port · PecoFence 0.1.3").font(.caption).foregroundStyle(.secondary)
@@ -295,6 +342,10 @@ struct SettingsView: View {
                 Text("⌘⌥Space: bring fences above apps. Esc: return to desktop.").font(.caption).foregroundStyle(.secondary)
                 Text("Click title bar to collapse. Double-click name to rename. Drag title to move; bottom-right corner to resize.")
                     .font(.caption).foregroundStyle(.secondary)
+                Toggle("Hide fenced Desktop items",isOn:Binding(get:{store.preferences.hideFencedDesktop},set:{store.preferences.hideFencedDesktop = $0; store.savePreferences(); store.changed?()}))
+                Text("Hide originals in Finder while fences are visible. Restore when disabled or PecoFence quits.").font(.caption).foregroundStyle(.secondary)
+                Toggle("Snap reordering",isOn:Binding(get:{store.preferences.snapReordering},set:{store.preferences.snapReordering = $0; store.savePreferences()}))
+                Text("Drag a title onto another fence to reorder its stack. Turn off for free movement.").font(.caption).foregroundStyle(.secondary)
             }
             Section("Appearance") {
                 Picker("Theme", selection:Binding(get:{store.state.theme},set:{store.send(["op":"settings","theme":$0])})) {
@@ -307,7 +358,7 @@ struct SettingsView: View {
                     Button("Import…") { AppDelegate.shared.importConfig() }
                     Button("Show backups") { NSWorkspace.shared.open(Engine.configDirectory) }
                 }
-                Text("Grouping references files; it does not move or delete them. Finder desktop icons remain visible.")
+                Text("Grouping references files; originals stay in their folders.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }.formStyle(.grouped)
@@ -341,19 +392,23 @@ struct SettingsView: View {
     }
     var snapshots: some View {
         VStack(alignment:.leading,spacing:12) {
-            Text("Save fence positions and file memberships. Restoring a layout does not change files on disk.")
+            Text("Save project groups and positions. Switch from the menu bar or ⌘⌥[ / ⌘⌥]. Files stay on disk.")
                 .font(.callout).foregroundStyle(.secondary)
             List {
                 ForEach(store.state.snapshots) { snapshot in
-                    HStack { Text(snapshot.name); Spacer(); Button("Restore") { store.send(["op":"snapshot-restore","id":snapshot.id]) } }
+                    HStack {
+                        if snapshot.id == store.preferences.activeWorkspace { Image(systemName:"checkmark").accessibilityLabel("Active workspace") }
+                        Text(snapshot.name); Spacer(); Button("Switch") { store.restoreWorkspace(snapshot) }
+                    }
                 }
-                if store.state.snapshots.isEmpty { Text("No saved layouts.").foregroundStyle(.secondary) }
+                if store.state.snapshots.isEmpty { Text("No saved workspaces.").foregroundStyle(.secondary) }
             }
             HStack {
-                TextField("Layout name",text:$snapshotName)
-                Button("Save layout") { store.send(["op":"snapshot-save","name":snapshotName]); snapshotName = "" }
+                TextField("Workspace name",text:$snapshotName)
+                Button("Save workspace") { store.saveWorkspace(snapshotName); snapshotName = "" }
                     .disabled(snapshotName.trimmingCharacters(in:.whitespaces).isEmpty)
             }
+            Toggle("Restore matching workspace when displays reconnect",isOn:Binding(get:{store.preferences.restoreDisplays},set:{store.preferences.restoreDisplays = $0; store.savePreferences()}))
         }.padding(12)
     }
 }

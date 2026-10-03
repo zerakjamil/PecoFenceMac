@@ -117,6 +117,23 @@ def main():
         assert (config / "config.json").read_bytes() == before, "Off-screen cascade changed saved layout"
         print("PASS: expansion cascade, collapse restoration, atomic locked/screen-limit rejection")
 
+        request("update", id=top["id"], geometry=dict(top["geometry"], h=310, workH=1000))
+        state = request("reorder", id=bottom["id"], target=top["id"], after=False)
+        assert [f["geometry"]["y"] for f in state["fences"]] == [218, 264, 30]
+        request("update", id=middle["id"], locked=True)
+        before = (config / "config.json").read_bytes()
+        request("reorder", fail=True, id=bottom["id"], target=middle["id"], after=True)
+        assert (config / "config.json").read_bytes() == before
+        fingerprint = [{"devicePath":"stable-display-uuid","workDip":[1440,1000],"dpi":96}]
+        state = request("snapshot-save", name="Monitor workspace", fingerprint=fingerprint)
+        workspace = state["snapshots"][-1]
+        assert workspace["displays"] == ["stable-display-uuid"]
+        request("update", id=top["id"], title="Changed workspace")
+        state = request("snapshot-restore", id=workspace["id"])
+        assert state["fences"][0]["title"] == "Desktop"
+        assert json.loads((config / "config.json").read_text())["layouts"][0]["fingerprint"] == fingerprint
+        print("PASS: snap reorder, atomic reorder rejection, display-profile workspace save/restore")
+
 
 if __name__ == "__main__":
     main()

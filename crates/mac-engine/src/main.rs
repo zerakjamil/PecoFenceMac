@@ -24,7 +24,7 @@ fn run() -> Result<Value, String> {
     if args.iter().any(|a| a == "--help") {
         return Ok(
             json!({"usage":"pecofence-mac-cli [--config-dir PATH] < request.json",
-            "operations":["state","sync","create","update","delete","assign","remove","rule-add","rule-delete","apply-rules","snapshot-save","snapshot-restore","settings","export","import"],
+            "operations":["state","sync","create","update","reorder","delete","assign","remove","rule-add","rule-delete","apply-rules","snapshot-save","snapshot-restore","settings","export","import"],
             "example":{"op":"create","title":"Projects"}}),
         );
     }
@@ -160,6 +160,7 @@ fn operate(cfg: &mut Config, req: &Value) -> Result<(), String> {
             cfg.layouts[0].fences.push(f);
         }
         "update" => {
+            apply_geometries(cfg, req)?;
             let fid = id(req, "id")?;
             let f = fence_mut(cfg, fid)?;
             let before = f.clone();
@@ -202,6 +203,15 @@ fn operate(cfg: &mut Config, req: &Value) -> Result<(), String> {
                     req["mainMonitor"].as_str(),
                 )?;
             }
+        }
+        "reorder" => {
+            apply_geometries(cfg, req)?;
+            reorder_fence(
+                &mut cfg.layouts[0].fences,
+                id(req, "id")?,
+                id(req, "target")?,
+                req["after"].as_bool().unwrap_or(false),
+            )?;
         }
         "delete" => {
             let fid = id(req, "id")?;
@@ -270,6 +280,11 @@ fn operate(cfg: &mut Config, req: &Value) -> Result<(), String> {
         }
         "apply-rules" => apply_rules(cfg, true),
         "snapshot-save" => {
+            if !req["fingerprint"].is_null() {
+                cfg.layouts[0].fingerprint = serde_json::from_value(req["fingerprint"].clone())
+                    .map_err(|e| e.to_string())?;
+            }
+            apply_geometries(cfg, req)?;
             cfg.snapshots.push(Snapshot {
                 id: Uuid::new_v4(),
                 name: required(req, "name")?.into(),
@@ -328,6 +343,87 @@ fn operate(cfg: &mut Config, req: &Value) -> Result<(), String> {
 
 const TITLE_HEIGHT: f32 = 38.0;
 const STACK_GAP: f32 = 8.0;
+
+fn apply_geometries(cfg: &mut Config, req: &Value) -> Result<(), String> {
+    if let Some(geometries) = req["geometries"].as_object() {
+        for (fid, geometry) in geometries {
+            let fid = Uuid::parse_str(fid).map_err(|e| e.to_string())?;
+            fence_mut(cfg, fid)?.geometry =
+                serde_json::from_value(geometry.clone()).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn reorder_fence(
+    fences: &mut [Fence],
+    source_id: Uuid,
+    target_id: Uuid,
+    after: bool,
+) -> Result<(), String> {
+    if source_id == target_id {
+        return Ok(());
+    }
+    let source = fences
+        .iter()
+        .position(|f| f.id == source_id)
+        .ok_or("Fence not found")?;
+    let target = fences
+        .iter()
+        .find(|f| f.id == target_id)
+        .ok_or("Target fence not found")?
+        .clone();
+    if fences[source].locked {
+        return Err("Unlock the source fence before reordering.".into());
+    }
+    let mut column: Vec<usize> = fences
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| {
+            f.geometry.monitor == target.geometry.monitor && horizontal_overlap(f, &target)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let top = column
+        .iter()
+        .map(|i| fences[*i].geometry.y)
+        .fold(target.geometry.y, f32::min);
+    column.retain(|i| *i != source);
+    column.sort_by(|a, b| fences[*a].geometry.y.total_cmp(&fences[*b].geometry.y));
+    let insertion = column
+        .iter()
+        .position(|i| fences[*i].id == target_id)
+        .ok_or("Target column not found")?
+        + usize::from(after);
+    column.insert(insertion, source);
+    let mut y = top;
+    for index in column {
+        let fence = &mut fences[index];
+        if fence.locked
+            && ((fence.geometry.y - y).abs() > 0.5
+                || (fence.geometry.x - target.geometry.x).abs() > 0.5)
+        {
+            return Err(format!(
+                "Unlock {} before reordering this stack.",
+                fence.title
+            ));
+        }
+        if y + visible_height(fence) > target.geometry.work_h
+            || target.geometry.x + fence.geometry.w > target.geometry.work_w
+        {
+            return Err(
+                "Not enough screen space for this stack. Collapse or resize a fence first.".into(),
+            );
+        }
+        fence.geometry.y = y;
+        fence.geometry.x = target.geometry.x;
+        fence.geometry.monitor = target.geometry.monitor.clone();
+        fence.geometry.work_h = target.geometry.work_h;
+        fence.geometry.work_w = target.geometry.work_w;
+        y += visible_height(fence) + STACK_GAP;
+    }
+    Ok(())
+}
 
 fn visible_height(fence: &Fence) -> f32 {
     if fence.rolled_up {
@@ -590,7 +686,7 @@ fn presentation(cfg: &Config) -> Value {
         let items:Vec<Value>=f.items.iter().filter_map(|r|cfg.items.get(&r.item_id)).map(|i|json!({"id":i.id,"path":i.key.as_path(),"name":i.display_name,"isFolder":i.is_folder,"mtime":i.mtime,"size":i.size})).collect();
         json!({"id":f.id,"title":f.title,"kind":f.kind,"source":f.source,"geometry":f.geometry,"rolledUp":f.rolled_up,"locked":f.locked,"view":f.view.layout,"sort":f.view.sort,"items":items})
     }).collect();
-    json!({"fences":fences,"rules":cfg.rules.list,"snapshots":cfg.snapshots.iter().map(|s|json!({"id":s.id,"name":s.name})).collect::<Vec<_>>(),
+    json!({"fences":fences,"rules":cfg.rules.list,"snapshots":cfg.snapshots.iter().map(|s|json!({"id":s.id,"name":s.name,"displays":s.layouts.first().map(|l|l.fingerprint.iter().map(|m|m.device_path.clone()).collect::<Vec<_>>()).unwrap_or_default()})).collect::<Vec<_>>(),
         "theme":match cfg.settings.theme {ThemeSetting::Dark=>"dark",ThemeSetting::Light=>"light",_=>"system"},"keepUpdated":cfg.rules.keep_updated})
 }
 
@@ -688,5 +784,30 @@ mod tests {
         fences[0].rolled_up = false;
         reflow_fences(&mut fences, &source, Some("display-1")).unwrap();
         assert_eq!(fences[1].geometry.y, 328.0);
+    }
+
+    #[test]
+    fn reorder_inserts_into_stack_without_changing_heights() {
+        let first = panel("First", 20.0, 20.0, 200.0, false);
+        let second = panel("Second", 20.0, 228.0, 180.0, false);
+        let third = panel("Third", 20.0, 416.0, 300.0, true);
+        let mut fences = vec![first.clone(), second.clone(), third.clone()];
+        reorder_fence(&mut fences, third.id, first.id, false).unwrap();
+        assert_eq!(fences[2].geometry.y, 20.0);
+        assert_eq!(fences[0].geometry.y, 66.0);
+        assert_eq!(fences[1].geometry.y, 274.0);
+        assert_eq!(fences[2].geometry.h, 300.0);
+    }
+
+    #[test]
+    fn reorder_respects_locks_and_screen_limits() {
+        let first = panel("First", 20.0, 20.0, 200.0, false);
+        let mut second = panel("Second", 20.0, 228.0, 180.0, false);
+        second.locked = true;
+        let mut fences = vec![first.clone(), second.clone()];
+        assert!(reorder_fence(&mut fences, first.id, second.id, true).is_err());
+        fences[1].locked = false;
+        fences[1].geometry.work_h = 300.0;
+        assert!(reorder_fence(&mut fences, first.id, second.id, true).is_err());
     }
 }

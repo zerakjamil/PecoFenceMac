@@ -1,13 +1,15 @@
 import AppKit
 import SwiftUI
 import Carbon
+import Quartz
 
 @MainActor final class FencePanel: NSPanel {
     override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { false }
+    override var canBecomeMain: Bool { true }
 }
 
 @MainActor final class FenceHostingView: NSHostingView<FenceView> {
+    override func acceptsFirstMouse(for event:NSEvent?) -> Bool { true }
     let store: DesktopStore
     let fenceID: String
     convenience init(store:DesktopStore, fenceID:String) {
@@ -48,17 +50,21 @@ import Carbon
     override func concludeDragOperation(_ sender:NSDraggingInfo?) { store.dropTarget = nil }
 }
 
-@MainActor final class FenceController: NSObject, NSWindowDelegate {
+@MainActor final class FenceController: NSWindowController, NSWindowDelegate {
+
     let panel: FencePanel
     var fence: Fence
     let store: DesktopStore
     private var applying = false
+    private var targetFrame: NSRect?
+    private var animationVersion = 0
+    var layoutFrame: NSRect { applying ? targetFrame ?? panel.frame : panel.frame }
     private var geometrySave: DispatchWorkItem?
     static var desktopLevel: NSWindow.Level { NSWindow.Level(rawValue:Int(CGWindowLevelForKey(.desktopIconWindow)) + 1) }
     init(fence: Fence, store: DesktopStore) {
         self.fence = fence; self.store = store
         panel = FencePanel(contentRect:.zero,styleMask:[.borderless,.nonactivatingPanel],backing:.buffered,defer:false)
-        super.init()
+        super.init(window:panel)
         panel.title = fence.title
         panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = true
         panel.hidesOnDeactivate = false; panel.isReleasedWhenClosed = false
@@ -68,12 +74,13 @@ import Carbon
         panel.delegate = self
         apply(fence)
     }
+    required init?(coder:NSCoder) { fatalError("init(coder:) unsupported") }
     func screen(for geometry:Geometry) -> NSScreen? {
-        NSScreen.screens.first { String(($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0) == geometry.monitor } ?? NSScreen.screens.first
+        NSScreen.screens.first { DisplayIdentity.identifier($0) == geometry.monitor || String(($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0) == geometry.monitor } ?? NSScreen.screens.first
     }
-    func apply(_ fence:Fence) {
+    func apply(_ fence:Fence, animated:Bool = false) {
+        let wasCollapsed = self.fence.rolledUp
         self.fence = fence
-        applying = true
         panel.title = fence.title
         panel.appearance = store.state.theme == "dark" ? NSAppearance(named:.darkAqua) : store.state.theme == "light" ? NSAppearance(named:.aqua) : nil
         if let screen = screen(for:fence.geometry) {
@@ -82,9 +89,29 @@ import Carbon
             let height = fence.rolledUp ? 38 : min(max(160,g.h),work.height)
             let x = min(max(work.minX + g.x,work.minX),work.maxX-width)
             let top = min(max(work.maxY-g.y,work.minY+height),work.maxY)
-            panel.setFrame(NSRect(x:x,y:top-height,width:width,height:height),display:true)
+            let frame = NSRect(x:x,y:top-height,width:width,height:height)
+            if applying && targetFrame == frame { return }
+            guard panel.frame != frame else { return }
+            geometrySave?.cancel()
+            animationVersion += 1
+            let version = animationVersion
+            applying = true; targetFrame = frame
+            let shouldAnimate = animated && panel.isVisible && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            if shouldAnimate && !wasCollapsed && fence.rolledUp { store.closingFences.insert(fence.id) }
+            if !fence.rolledUp { store.closingFences.remove(fence.id) }
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = shouldAnimate ? 0.14 : 0
+                context.timingFunction = CAMediaTimingFunction(name:.easeOut)
+                if shouldAnimate { panel.animator().setFrame(frame,display:true) }
+                else { panel.setFrame(frame,display:true) }
+            } completionHandler: { [weak self] in
+                DispatchQueue.main.async {
+                    guard let self, self.animationVersion == version else { return }
+                    self.applying = false
+                    self.store.closingFences.remove(fence.id)
+                }
+            }
         }
-        applying = false
     }
     func windowDidMove(_ notification:Notification) {
         guard !applying else { return }
@@ -96,7 +123,7 @@ import Carbon
     func persistGeometry() {
         guard !applying, !fence.locked, let screen = panel.screen else { return }
         let work = screen.visibleFrame, frame = panel.frame
-        let monitor = String((screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0)
+        let monitor = DisplayIdentity.identifier(screen)
         store.update(fence,["geometry":["monitor":monitor,"x":frame.minX-work.minX,"y":work.maxY-frame.maxY,
             "w":frame.width,"h":fence.rolledUp ? fence.geometry.h : frame.height,"workW":work.width,"workH":work.height,"anchor":"leftTop"]])
     }
@@ -105,6 +132,7 @@ import Carbon
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
     static var shared: AppDelegate!
     let store = DesktopStore()
+    let preview = PreviewCoordinator()
     var fences: [String:FenceController] = [:]
     var statusItem: NSStatusItem!
     var settings: NSWindow?
@@ -112,22 +140,29 @@ import Carbon
     var hidden = false
     var peeking = false
     var previousApplication: NSRunningApplication?
-    var hotkey: EventHotKeyRef?
+    var hotkeys: [EventHotKeyRef] = []
+    var workspaceMenu = NSMenu()
+    var displayChange: DispatchWorkItem?
+    var knownDisplays: [String] = []
     var hotkeyHandler: EventHandlerRef?
     var escapeMonitor: Any?
+    let desktopVisibility = DesktopVisibilityController(journal:Engine.configDirectory.appendingPathComponent("desktop-visibility.json"))
+    let visibilityQueue = DispatchQueue(label:"PecoFence.desktop-visibility",qos:.utility)
 
     func applicationDidFinishLaunching(_ notification:Notification) {
         AppDelegate.shared = self
+        preview.nextResponder = NSApp.nextResponder; NSApp.nextResponder = preview
         let peers = NSRunningApplication.runningApplications(withBundleIdentifier:Bundle.main.bundleIdentifier ?? "jp.jiang.pecofence.mac")
         if let peer = peers.first(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }) {
             peer.activate(options:[]); NSApp.terminate(nil); return
         }
         NSApp.setActivationPolicy(.accessory)
+        knownDisplays = DisplayIdentity.identifiers
         setupMenus()
         store.changed = { [weak self] in self?.applyState() }
         store.refresh()
         timer = Timer.scheduledTimer(withTimeInterval:3,repeats:true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.store.refresh(); self?.refreshPortals() }
+            MainActor.assumeIsolated { self?.store.refresh(); self?.store.refreshGit(); self?.refreshPortals() }
         }
         NotificationCenter.default.addObserver(self,selector:#selector(screensChanged),name:NSApplication.didChangeScreenParametersNotification,object:nil)
         registerPeek()
@@ -155,14 +190,27 @@ import Carbon
                 guard self.fences.values.allSatisfy({ $0.panel.level == .floating }) else { exit(1) }
                 self.endPeek()
                 guard self.fences.values.allSatisfy({ $0.panel.level == FenceController.desktopLevel && $0.panel.isVisible }) else { exit(1) }
-                print("SMOKE OK: \(self.fences.count) native desktop panels")
-                NSApp.terminate(nil)
+                guard TitleDragView().acceptsFirstMouse(for:nil), ResizeView().acceptsFirstMouse(for:nil),
+                      self.fences.values.allSatisfy({ $0.panel.contentView?.acceptsFirstMouse(for:nil) == true }) else { exit(1) }
+                if let controller = self.fences.values.first(where: { !$0.fence.items.isEmpty }), let file = controller.fence.items.first {
+                    self.preview.show(files:controller.fence.items,selected:file.id,window:controller.panel)
+                    DispatchQueue.main.asyncAfter(deadline:.now()+0.2) {
+                        guard let preview = QLPreviewPanel.shared(), preview.currentController != nil,
+                              preview.dataSource?.numberOfPreviewItems(in:preview) == controller.fence.items.count else {
+                            fputs("SMOKE FAILED: Quick Look controller (key: \(NSApp.keyWindow?.title ?? "nil"), error: \(self.store.error ?? "nil"))\n",stderr); exit(1)
+                        }
+                        preview.orderOut(nil)
+                        print("SMOKE OK: first-click controls, Quick Look, \(self.fences.count) native desktop panels")
+                        NSApp.terminate(nil)
+                    }
+                } else { print("SMOKE OK: \(self.fences.count) native desktop panels"); NSApp.terminate(nil) }
             }
         }
     }
     func applicationWillTerminate(_ notification:Notification) {
         timer?.invalidate()
-        if let hotkey { UnregisterEventHotKey(hotkey) }
+        visibilityQueue.sync { try? desktopVisibility.reconcile(paths:[],desktop:store.desktop) }
+        for hotkey in hotkeys { UnregisterEventHotKey(hotkey) }
         if let hotkeyHandler { RemoveEventHandler(hotkeyHandler) }
         if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor) }
     }
@@ -185,6 +233,8 @@ import Carbon
         for (title,action,key) in [("New fence…",#selector(createFence),""),("Folder portal…",#selector(createPortal),""),("Show / hide fences",#selector(toggleHidden),""),("Peek  ⌘⌥Space",#selector(togglePeek),""),("Settings…",#selector(showSettings),"")] {
             menu.addItem(withTitle:title,action:action,keyEquivalent:key).target = self
         }
+        let workspaceItem = NSMenuItem(title:"Workspaces",action:nil,keyEquivalent:"")
+        workspaceItem.submenu = workspaceMenu; menu.insertItem(workspaceItem,at:3)
         menu.addItem(.separator())
         menu.addItem(withTitle:"Quit PecoFence",action:#selector(NSApplication.terminate(_:)),keyEquivalent:"q")
         statusItem.menu = menu
@@ -196,16 +246,56 @@ import Carbon
         for fence in store.state.fences {
             let controller = fences[fence.id] ?? FenceController(fence:fence,store:store)
             fences[fence.id] = controller
-            controller.apply(fence)
+            controller.apply(fence,animated:true)
             controller.panel.level = peeking ? .floating : FenceController.desktopLevel
             if hidden { controller.panel.orderOut(nil) } else { controller.panel.orderFrontRegardless() }
+        }
+        workspaceMenu.removeAllItems()
+        for snapshot in store.state.snapshots {
+            let item = NSMenuItem(title:snapshot.name,action:#selector(selectWorkspace(_:)),keyEquivalent:"")
+            item.target = self; item.representedObject = snapshot.id
+            item.state = snapshot.id == store.preferences.activeWorkspace ? .on : .off
+            workspaceMenu.addItem(item)
+        }
+        if store.state.snapshots.isEmpty { let item = NSMenuItem(title:"No saved workspaces",action:nil,keyEquivalent:""); item.isEnabled = false; workspaceMenu.addItem(item) }
+        workspaceMenu.addItem(.separator())
+        workspaceMenu.addItem(withTitle:"Save current workspace…",action:#selector(saveWorkspace),keyEquivalent:"").target = self
+        let paths = store.preferences.hideFencedDesktop && !hidden ? Set(store.state.fences.filter { $0.kind != "folderPortal" }.flatMap { $0.items.map(\.path) }) : []
+        let desktop = store.desktop, visibility = desktopVisibility
+        visibilityQueue.async { [weak self] in
+            guard let self else { return }
+            do { try visibility.reconcile(paths:paths,desktop:desktop) }
+            catch { DispatchQueue.main.async { self.store.error = "Desktop visibility: \(error.localizedDescription)" } }
         }
     }
     func refreshPortals() {
         // Directory membership is live and independent of virtual-item config changes.
         if store.state.fences.contains(where: { $0.kind == "folderPortal" }) { store.objectWillChange.send() }
     }
-    @objc func screensChanged() { applyState() }
+    @objc func screensChanged() {
+        displayChange?.cancel()
+        let task = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            let displays = DisplayIdentity.identifiers
+            self.applyState()
+            if displays != self.knownDisplays { self.knownDisplays = displays; self.store.restoreDisplayWorkspace() }
+        }
+        displayChange = task; DispatchQueue.main.asyncAfter(deadline:.now()+0.8,execute:task)
+    }
+    @objc func selectWorkspace(_ item:NSMenuItem) {
+        if let id = item.representedObject as? String, let snapshot = store.state.snapshots.first(where: { $0.id == id }) { store.restoreWorkspace(snapshot) }
+    }
+    @objc func saveWorkspace() { if let name = prompt("Save workspace") { store.saveWorkspace(name) } }
+    func previewReorder(window:NSWindow) {
+        let point = NSEvent.mouseLocation
+        store.reorderTarget = fences.values.filter { $0.panel !== window && $0.panel.isVisible && $0.panel.frame.insetBy(dx:-16,dy:-16).contains(point) }
+            .min { hypot($0.panel.frame.midX-point.x,$0.panel.frame.midY-point.y) < hypot($1.panel.frame.midX-point.x,$1.panel.frame.midY-point.y) }?.fence.id
+    }
+    func finishReorder(window:NSWindow) {
+        defer { store.reorderTarget = nil }
+        guard let source = fences.values.first(where: { $0.panel === window }), let id = store.reorderTarget, let target = fences[id] else { return }
+        store.send(["op":"reorder","id":source.fence.id,"target":id,"after":NSEvent.mouseLocation.y < target.panel.frame.midY,"geometries":store.capturedGeometries()])
+    }
     @objc func toggleHidden() { hidden.toggle(); applyState() }
     @objc func togglePeek() {
         if peeking { endPeek(); return }
@@ -259,6 +349,15 @@ import Carbon
         panel.message = "Files stay in their original locations."
         if panel.runModal() == .OK { store.assign(panel.urls,to:fence) }
     }
+    func openProjectWith(_ folder:URL) {
+        NSApp.activate(ignoringOtherApps:true)
+        let panel = NSOpenPanel(); panel.canChooseFiles = true; panel.canChooseDirectories = false
+        panel.directoryURL = URL(fileURLWithPath:"/Applications"); panel.allowedContentTypes = [.applicationBundle]
+        panel.prompt = "Open project"
+        if panel.runModal() == .OK, let app = panel.url {
+            ProjectActions.open(folder:folder,application:ProjectApplication(id:Bundle(url:app)?.bundleIdentifier ?? "custom",name:app.deletingPathExtension().lastPathComponent,url:app),store:store)
+        }
+    }
     func delete(_ fence:Fence) {
         let alert = NSAlert(); alert.messageText = "Delete \(fence.title)?"
         alert.informativeText = "Files remain on disk. Virtual assignments return to the Desktop fence."
@@ -287,14 +386,25 @@ import Carbon
     }
     func registerPeek() {
         var type = EventTypeSpec(eventClass:OSType(kEventClassKeyboard),eventKind:UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _,_,_ in
-            DispatchQueue.main.async { AppDelegate.shared.togglePeek() }; return noErr
+        InstallEventHandler(GetApplicationEventTarget(), { _,event,_ in
+            var id = EventHotKeyID()
+            guard GetEventParameter(event,UInt32(kEventParamDirectObject),UInt32(typeEventHotKeyID),nil,MemoryLayout<EventHotKeyID>.size,nil,&id) == noErr else { return OSStatus(eventNotHandledErr) }
+            let shortcut = id.id
+            DispatchQueue.main.async {
+                if shortcut == 1 { AppDelegate.shared.togglePeek() }
+                else { AppDelegate.shared.store.cycleWorkspace(step:shortcut == 2 ? 1 : -1) }
+            }; return noErr
         },1,&type,nil,&hotkeyHandler)
-        let status = RegisterEventHotKey(UInt32(kVK_Space),UInt32(cmdKey | optionKey),EventHotKeyID(signature:0x5045434F,id:1),GetApplicationEventTarget(),0,&hotkey)
-        if status != noErr { store.error = "⌘⌥Space is already in use. Peek remains available from the menu bar." }
+        for (id,key) in [(UInt32(1),kVK_Space),(UInt32(2),kVK_ANSI_RightBracket),(UInt32(3),kVK_ANSI_LeftBracket)] {
+            var hotkey: EventHotKeyRef?
+            let status = RegisterEventHotKey(UInt32(key),UInt32(cmdKey | optionKey),EventHotKeyID(signature:0x5045434F,id:id),GetApplicationEventTarget(),0,&hotkey)
+            if status == noErr, let hotkey { hotkeys.append(hotkey) }
+            else { store.error = "A PecoFence shortcut is already in use. Peek and workspaces remain available from the menu bar." }
+        }
     }
 }
 
+#if !PECOFENCE_TESTS
 @main struct PecoFenceMain {
     @MainActor static func main() {
         let application = NSApplication.shared
@@ -303,3 +413,4 @@ import Carbon
         application.run()
     }
 }
+#endif
