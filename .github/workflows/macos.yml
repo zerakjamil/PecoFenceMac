@@ -1,0 +1,24 @@
+name: macOS port
+on:
+  push:
+    paths: ["macos/**", "crates/core/**", "crates/mac-engine/**", "scripts/*macos*", "Cargo.toml", "Cargo.lock", ".github/workflows/macos.yml"]
+  pull_request:
+    paths: ["macos/**", "crates/core/**", "crates/mac-engine/**", "scripts/*macos*", "Cargo.toml", "Cargo.lock", ".github/workflows/macos.yml"]
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt -p pecofence-mac-cli --check
+      - run: cargo test --locked -p pecofence-core
+      - run: cargo test --locked -p pecofence-mac-cli
+      - run: cargo clippy --locked -p pecofence-mac-cli -- -D warnings
+      - run: bash scripts/build-macos.sh
+      - run: python3 scripts/test-macos.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PecoFence-macOS
+          path: dist/PecoFence-macOS-*.zip

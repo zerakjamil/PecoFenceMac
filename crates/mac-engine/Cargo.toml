@@ -1,0 +1,13 @@
+[package]
+name = "pecofence-mac-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pecofence-core = { path = "../core" }
+serde_json.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

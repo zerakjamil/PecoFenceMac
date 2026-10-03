@@ -305,6 +305,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pecofence-mac-cli"
+version = "0.1.3"
+dependencies = [
+ "pecofence-core",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "pecofence-platform"
 version = "0.1.3"
 dependencies = [

@@ -1,3 +1,35 @@
+# PecoFenceMac
+
+Native macOS port of [DayuanJiang/PecoFence](https://github.com/DayuanJiang/PecoFence).
+AppKit desktop panels and SwiftUI settings share the original Rust rule engine,
+configuration format, snapshots, and backups.
+
+- Group files without moving their originals; browse live folder portals.
+- Click a title bar to expand or collapse. Expanding pushes lower fences down;
+  collapsing closes contiguous stacks. Double-click the name to rename.
+- Move and resize panels, switch icon/list views, and lock settled positions.
+- Route Desktop files by extension, save layouts, and import/export configuration.
+- Use **⌘⌥Space** for Peek, **Esc** to return, and the bundled JSON CLI for scripts.
+- Choose System, Light, or Dark appearance across panels and settings.
+
+Requires macOS 14+, Xcode command-line tools, and Rust stable. Tested on Apple
+Silicon with macOS 26.5.1.
+
+```sh
+bash scripts/build-macos.sh
+open "$HOME/Library/Caches/PecoFence/build/PecoFence.app"
+```
+
+[Mac installation, CLI, and limitations](macos/README.md) ·
+[Proposed developer features](macos/ROADMAP.md)
+
+Apache 2.0. Original Windows source and notices are retained. The Mac port does
+not yet implement every upstream feature; see the linked limitations.
+
+## Upstream Windows documentation
+
+The following README describes the original Windows application.
+
 https://github.com/user-attachments/assets/c827f059-cfd7-4f6a-bed3-8b00411a7220
 
 <p align="center">
